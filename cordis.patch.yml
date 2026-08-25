@@ -1,0 +1,10 @@
+# @momojie-s/dsh-subagent-cleanup 组合包 patch 层：被 profile bundles 列表引用时应用。
+# 行 name 用包名（非 file:// URL），由 Node 模块解析到已安装的包。
+# 工具默认名 subagent_cleanup / subagent_cleanup_global，与内置工具不冲突。
+- insert:
+    - id: subagent-cleanup
+      name: '@momojie-s/dsh-subagent-cleanup'
+      config:
+        defaultIdleHours: 24      # 运维大扫除的默认闲置门槛（小时）
+        settleBufferMs: 30000     # inactive(仅磁盘)子级的写入缓冲（毫秒）
+        liveBufferMs: 600000      # running(在内存)子级需静默多久才可处置（毫秒）
