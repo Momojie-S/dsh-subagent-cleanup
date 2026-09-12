@@ -11,7 +11,7 @@ DSH 官方没有会话删除能力(API 只有归档隐藏,不减少 `session.lis
 
 ## 环境要求
 
-- DSH `0.1.1-rc.2`(验证基准);host 半部插件,无浏览器组件,任意 profile 可用
+- DSH `0.1.5-rc.1`(验证基准);host 半部插件,无浏览器组件,任意 profile 可用
 - Windows / Linux / macOS(`fs.rename` 同卷移动;DSH home 与 sessions 同盘)
 
 ## 用法
