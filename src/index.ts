@@ -26,7 +26,8 @@ import type {} from '@deepseek-ai/cordis' // side-effect: ctx types
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-tools'
-import type { JsonValue, SessionId } from '@deepseek-ai/dsh-session'
+import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type {} from '@deepseek-ai/dsh-subagent' // side-effect: ctx.subagents types
 import type {} from '@deepseek-ai/dsh-system-prompt'
 
