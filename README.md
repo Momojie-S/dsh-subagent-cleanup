@@ -11,8 +11,9 @@ DSH 官方没有会话删除能力(API 只有归档隐藏,不减少 `session.lis
 
 ## 环境要求
 
-- DSH `>= 0.1.5-rc.1`（已验证至 `0.2.0-rc.2`）;host 半部插件,无浏览器组件,任意 profile 可用
+- DSH `>= 0.1.5-rc.1`(已验证至 `0.2.0-rc.2`);host 半部插件,无浏览器组件,任意 profile 可用
 - Windows / Linux / macOS(`fs.rename` 同卷移动;DSH home 与 sessions 同盘)
+- **0.2.0 机制注**:归档模式会先调官方 `workspaceRegistry.archiveSession` 登记 id 再搬移;workspace 包未挂载的 profile 自动退化为纯搬移(功能不损失,仅少官方归档集合语义)
 
 ## 用法
 
@@ -23,6 +24,10 @@ DSH 官方没有会话删除能力(API 只有归档隐藏,不减少 `session.lis
 - 工具结果返回:处置清单、跳过分类计数、释放空间、归档 manifest 路径
 
 参数要点(两个工具同构):`mode: archive(默认)/ delete(不可恢复)`,`dryRun: true` 只看清单;自清支持 `ids: [...]` 点名自己的后代;大扫除支持 `workspace` 子串 / `parent` 会话 id / `minIdleHours`。
+
+**归档 = 两步**(0.2.0 起):①把 id 登记进官方归档集合(数据尚在盘上,通过官方存在性检查;会话仍有活动则拒绝并跳过该候选)——Web UI 的工作区侧栏按官方集合过滤归档行、归档视图可一键恢复、归档闸门阻止其继续跑模型;②再把目录移入 `sessions-archive`(物理减负:列表/磁盘真正变小)。两种动作都会顺带删除该会话在 `storages/session_projcache` 的持久投影缓存记录(0.2.0 官方新增的缓存,自身无清理机制;进程内残影到下次重启为止,归档会话不会再被读取,无实际影响)。
+
+**历史回填**:`subagent_cleanup_global` 传 `backfillArchiveSet: true`——不清理,只把历史 manifest 里的已归档 id 逐个补登记进官方归档集合(搬回 → 登记 → 搬回,幂等;先 `dryRun: true` 预览)。一次性维护操作,建议空闲时跑。
 
 ## 安装
 
@@ -47,13 +52,15 @@ patch `config` 字段(全部可选):
 | `defaultIdleHours` | `24` | 大扫除闲置门槛(小时) |
 | `settleBufferMs` | `30000` | 仅磁盘子级的写入缓冲(毫秒) |
 | `liveBufferMs` | `600000` | 在内存子级需静默多久才可处置(毫秒) |
+| `registerOfficialArchive` | `true` | 归档前登记官方归档集合;`false` 退回纯搬移 |
+| `pruneProjcache` | `true` | 处置后删除该会话的持久投影缓存记录 |
 
 ## 验证
 
 插件加载成功后 DSH 日志出现一行:
 
 ```
-subagent-cleanup: active (tools subagent_cleanup/subagent_cleanup_global, home C:\...\.dsh, idle gate 24h)
+subagent-cleanup: active (tools subagent_cleanup/subagent_cleanup_global, home C:\...\.dsh, idle gate 24h, official-archive-set on, projcache prune on)
 ```
 
 会话里让模型执行 `dryRun: true` 的大扫除,返回的 `skippedByReason` 有合理分布(正在跑的 `possibly-live`/`attached-unknown` 被跳过)即为判据生效。

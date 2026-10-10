@@ -16,6 +16,16 @@ function check(name, fn) {
     throw error
   }
 }
+async function checkAsync(name, fn) {
+  try {
+    await fn()
+    passed += 1
+    console.log(`  ok ${name}`)
+  } catch (error) {
+    console.error(`  FAIL ${name}`)
+    throw error
+  }
+}
 
 console.log('isSubagentDirName')
 check('bare lowercase uuid is subagent-shaped', () => {
@@ -124,6 +134,82 @@ check('idle gate disabled (minIdleMs 0) still respects process start', () => {
   )
   assert.equal(block.eligible, false)
   assert.equal(block.skipReason, 'attached-unknown')
+})
+
+console.log('stillQuiescent — generational log artifacts (v3 + v4)')
+const { stillQuiescent, isActiveSessionRefusal, pruneProjcacheRecord } = await import('./lib/index.js')
+const { mkdtemp, writeFile: writeTestFile, utimes } = await import('node:fs/promises')
+const { tmpdir } = await import('node:os')
+const { join: pjoin } = await import('node:path')
+
+const tempRoot = await mkdtemp(pjoin(tmpdir(), 'cleanup-test-'))
+
+async function makeSessionDir(files) {
+  const dir = pjoin(tempRoot, `s-${Math.random().toString(16).slice(2)}`)
+  const { mkdir } = await import('node:fs/promises')
+  await mkdir(dir, { recursive: true })
+  for (const [name, mtimeMs] of Object.entries(files)) {
+    await writeTestFile(pjoin(dir, name), '{}')
+    await utimes(pjoin(dir, name), new Date(mtimeMs), new Date(mtimeMs))
+  }
+  return dir
+}
+
+{
+  const T = 1_700_000_000_000
+  const v3dir = await makeSessionDir({ 'session.jsonl.zstd': T })
+  const v4dir = await makeSessionDir({ 'session.v4.jsonl.zstd': T })
+  const bothdir = await makeSessionDir({ 'session.jsonl.zstd': T, 'session.v4.jsonl.zstd': T + 5_000 })
+
+  await checkAsync('v3 artifact untouched → quiescent', async () => {
+    assert.equal(await stillQuiescent(v3dir, T + 1), true)
+  })
+  await checkAsync('v3 artifact rewritten after planning → veto', async () => {
+    assert.equal(await stillQuiescent(v3dir, T - 1_000), false)
+  })
+  await checkAsync('v4 artifact untouched → quiescent (old code watched only v3 name)', async () => {
+    assert.equal(await stillQuiescent(v4dir, T + 1), true)
+  })
+  await checkAsync('v4 artifact rewritten after planning → veto (v4 blind-spot fix)', async () => {
+    assert.equal(await stillQuiescent(v4dir, T - 1_000), false)
+  })
+  await checkAsync('max over generational artifacts decides', async () => {
+    // v4 is 5s newer than v3: planned between them must veto, planned after both must pass
+    assert.equal(await stillQuiescent(bothdir, T + 2_000), false)
+    assert.equal(await stillQuiescent(bothdir, T + 6_000), true)
+  })
+  await checkAsync('vanished dir → not quiescent', async () => {
+    assert.equal(await stillQuiescent(pjoin(tempRoot, 'does-not-exist'), undefined), false)
+  })
+}
+
+console.log('isActiveSessionRefusal')
+check('official active-session error message classified as active', () => {
+  assert.equal(isActiveSessionRefusal(new Error("cannot archive session 'x': the session is active (turn)")), true)
+})
+check('unknown-session error is NOT an active refusal', () => {
+  assert.equal(isActiveSessionRefusal(new Error("cannot archive session 'x': live sessions and session persistence hold no such session")), false)
+})
+check('error.name classified as active', () => {
+  const err = new Error('whatever')
+  err.name = 'WorkspaceActiveSessionError'
+  assert.equal(isActiveSessionRefusal(err), true)
+})
+
+console.log('pruneProjcacheRecord')
+await checkAsync('existing record file is removed', async () => {
+  const home = pjoin(tempRoot, 'home-a')
+  const { mkdir } = await import('node:fs/promises')
+  await mkdir(pjoin(home, 'storages', 'session_projcache', 'sessions'), { recursive: true })
+  const rec = pjoin(home, 'storages', 'session_projcache', 'sessions', 'abc.json')
+  await writeTestFile(rec, '{}')
+  assert.equal(await pruneProjcacheRecord(home, 'abc'), true)
+  const { access } = await import('node:fs/promises')
+  await assert.rejects(() => access(rec))
+})
+await checkAsync('missing record file reads as pruned (force)', async () => {
+  const home = pjoin(tempRoot, 'home-b')
+  assert.equal(await pruneProjcacheRecord(home, 'def'), true)
 })
 
 console.log(`\n${passed} checks passed`)

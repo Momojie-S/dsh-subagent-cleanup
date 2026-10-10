@@ -1,6 +1,6 @@
 {
   "name": "@momojie-s/dsh-subagent-cleanup",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DSH 插件: 子agent会话清理 —— 会话自清(枚举本会话后代,归档/删除已停稳记录)+ 运维侧跨 workspace 大扫除(严格冷判据)",
   "type": "module",
   "main": "lib/index.js",

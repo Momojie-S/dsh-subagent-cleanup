@@ -14,13 +14,21 @@
  * incidents): only subagent-shaped records, never main sessions
  * (`session-` prefix); re-check the artifact mtime immediately before each
  * move/delete; archive mode is reversible by moving the dir back.
+ *
+ * 0.2.0 adaptation: archive mode first registers each id in the official
+ * workspace registry archive set (`workspaceRegistry.archiveSession`, while
+ * the data is still on disk), THEN moves the dir. The web UI's subagent
+ * lists are driven by parent-log catalog events, not directory scans, so a
+ * bare move leaves ghost rows; the official set is what gates/labels them.
+ * Both modes also delete the stale `storages/session_projcache` record
+ * (persisted projection cache has no pruning of its own).
  * @module @momojie-s/dsh-subagent-cleanup
  */
 
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { readdir, rename, rm, stat, mkdir, writeFile } from 'node:fs/promises'
+import { readdir, rename, rm, stat, mkdir, writeFile, readFile } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/cordis' // side-effect: ctx types
 import z from '@deepseek-ai/schemastery'
@@ -52,6 +60,10 @@ export interface Config {
   settleBufferMs?: number
   /** Buffer for `running` (in-memory) children: eligible once silent this long (ms, default 10min). */
   liveBufferMs?: number
+  /** Archive mode also registers ids in the official workspace archive set (default true; degrades to bare move when the registry is absent). */
+  registerOfficialArchive?: boolean
+  /** Delete the stale persisted-projection-cache record of every processed session (default true). */
+  pruneProjcache?: boolean
 }
 
 export const Config: z<Config> = z.object({
@@ -62,6 +74,8 @@ export const Config: z<Config> = z.object({
   defaultIdleHours: z.number().min(0).default(24),
   settleBufferMs: z.number().min(0).default(30_000),
   liveBufferMs: z.number().min(0).default(600_000),
+  registerOfficialArchive: z.boolean().default(true),
+  pruneProjcache: z.boolean().default(true),
 })
 
 // ---------------------------------------------------------------------------
@@ -99,7 +113,7 @@ export interface CleanupPolicy {
   readonly liveBufferMs: number
 }
 
-export type SkipReason = 'empty-dir' | 'subtree-live' | 'possibly-live' | 'just-settled' | 'attached-unknown' | 'too-recent'
+export type SkipReason = 'empty-dir' | 'subtree-live' | 'possibly-live' | 'just-settled' | 'attached-unknown' | 'too-recent' | 'workspace-active'
 
 export interface PlanEntry {
   readonly id: string
@@ -184,22 +198,64 @@ async function probeDir(dir: string): Promise<{ lastWriteMs: number | undefined;
   return { lastWriteMs: latest, sizeBytes: total }
 }
 
-/** Re-check the session artifact right before acting; returns false when it moved or got rewritten. */
-async function stillQuiescent(dir: string, plannedLastWriteMs: number | undefined): Promise<boolean> {
+/** Re-check the session log artifacts right before acting; returns false when it moved or got rewritten. (exported for tests) */
+export async function stillQuiescent(dir: string, plannedLastWriteMs: number | undefined): Promise<boolean> {
   try {
     const info = await stat(dir)
     if (!info.isDirectory()) return false
-    // The append-only artifact is the channel every write lands on: its mtime
-    // moving past the planned value means someone wrote after planning.
-    const artifact = join(dir, 'session.jsonl.zstd')
-    if (existsSync(artifact)) {
-      const art = await stat(artifact)
-      if (plannedLastWriteMs !== undefined && art.mtimeMs > plannedLastWriteMs) return false
+    // The append-only log artifacts are the channel every write lands on:
+    // v3 names `session.jsonl.zstd`, v4 names `session.v4.jsonl.zstd` — probe
+    // every generational artifact so a v4 write after planning still vetoes.
+    const names = await readdir(dir)
+    let latest: number | undefined
+    for (const name of names) {
+      if (!/^session.*\.jsonl(\.zstd)?$/.test(name)) continue
+      try {
+        const art = await stat(join(dir, name))
+        if (latest === undefined || art.mtimeMs > latest) latest = art.mtimeMs
+      } catch {
+        // raced away: treat as rewritten below via missing latest? keep going
+      }
     }
+    if (plannedLastWriteMs !== undefined && latest !== undefined && latest > plannedLastWriteMs) return false
     return true
   } catch {
     return false
   }
+}
+
+/** Delete the stale persisted-projection-cache record of one session; false when the file could not be removed. (exported for tests) */
+export async function pruneProjcacheRecord(home: string, id: string): Promise<boolean> {
+  try {
+    await rm(join(home, 'storages', 'session_projcache', 'sessions', `${id}.json`), { force: true })
+    return true
+  } catch {
+    return false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Official workspace archive set (structural face — no compile-time dependency)
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal structural face of `ctx.workspaceRegistry` (module
+ * `@deepseek-ai/dsh-workspace`). Resolved optionally so profiles without the
+ * workspace plugin degrade to the legacy bare-move behavior.
+ */
+interface WorkspaceRegistryFace {
+  readonly archivedSessionIds: readonly string[]
+  archiveSession(sessionId: string, options?: { stopActivity?: boolean }): Promise<void>
+}
+
+function resolveWorkspaceRegistry(ctx: Context): WorkspaceRegistryFace | undefined {
+  return (ctx as unknown as { get(name: string): unknown }).get('workspaceRegistry') as WorkspaceRegistryFace | undefined
+}
+
+/** Whether an archiveSession refusal means "session still has live work" (vs unknown/race). (exported for tests) */
+export function isActiveSessionRefusal(error: unknown): boolean {
+  const err = error as { name?: string; message?: string }
+  return err?.name === 'WorkspaceActiveSessionError' || /is active/i.test(err?.message ?? '')
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +279,13 @@ interface RunResult {
   processedIds: string[]
   failureDetails: string[]
   manifestPath: string | null
+  /** Ids registered in the official workspace archive set before the move. */
+  archivedSetRegistered: number
+  /** True when the workspace registry service was absent (degraded to bare move). */
+  archivedSetUnavailable: boolean
+  /** Stale persisted-projection-cache records deleted. */
+  projcachePruned: number
+  projcachePruneFailures: number
 }
 
 function emptyRunResult(mode: CleanupMode, dryRun: boolean): RunResult {
@@ -230,7 +293,14 @@ function emptyRunResult(mode: CleanupMode, dryRun: boolean): RunResult {
     ok: true, error: undefined, mode, dryRun, scanned: 0, eligible: 0, processed: 0,
     skippedExisting: 0, failures: 0, freedBytes: 0, skippedByReason: {},
     processedIds: [], failureDetails: [], manifestPath: null,
+    archivedSetRegistered: 0, archivedSetUnavailable: false,
+    projcachePruned: 0, projcachePruneFailures: 0,
   }
+}
+
+/** Strip `undefined` property values: they are not lossless JSON and DSH rejects tool output containing them. */
+function toJsonValue(value: Record<string, unknown>): Record<string, JsonValue> {
+  return JSON.parse(JSON.stringify(value)) as Record<string, JsonValue>
 }
 
 export function apply(ctx: Context, config: Config): void {
@@ -241,6 +311,8 @@ export function apply(ctx: Context, config: Config): void {
   const liveBufferMs = config.liveBufferMs ?? 600_000
   const toolSelf = config.toolSelf ?? 'subagent_cleanup'
   const toolGlobal = config.toolGlobal ?? 'subagent_cleanup_global'
+  const registerOfficialArchive = config.registerOfficialArchive ?? true
+  const pruneProjcache = config.pruneProjcache ?? true
 
   // Captured at plugin load; uptime walk makes it the true process start.
   const processStartMs = Date.now() - process.uptime() * 1000
@@ -323,6 +395,9 @@ export function apply(ctx: Context, config: Config): void {
     result.eligible = plan.filter(entry => entry.eligible).length
     if (dryRun) return result
 
+    const registry = registerOfficialArchive ? resolveWorkspaceRegistry(ctx) : undefined
+    if (registerOfficialArchive && registry === undefined) result.archivedSetUnavailable = true
+
     for (const candidate of candidates) {
       const verdict = planById.get(candidate.id)
       if (verdict === undefined || !verdict.eligible) continue
@@ -338,10 +413,29 @@ export function apply(ctx: Context, config: Config): void {
             result.skippedExisting += 1
             continue
           }
+          // Register in the official archive set BEFORE the move: the registry
+          // refuses unknown sessions, so the data must still be on disk here.
+          // An active-session refusal is a safety verdict — skip the candidate.
+          if (registry !== undefined) {
+            try {
+              await registry.archiveSession(candidate.id)
+              result.archivedSetRegistered += 1
+            } catch (error) {
+              if (isActiveSessionRefusal(error)) {
+                result.skippedByReason['workspace-active'] = (result.skippedByReason['workspace-active'] ?? 0) + 1
+                continue
+              }
+              throw error
+            }
+          }
           await mkdir(join(archiveRoot, candidate.workspaceDir), { recursive: true })
           await rename(sourceDir, targetDir)
         } else {
           await rm(sourceDir, { recursive: true, force: true })
+        }
+        if (pruneProjcache) {
+          if (await pruneProjcacheRecord(home, candidate.id)) result.projcachePruned += 1
+          else result.projcachePruneFailures += 1
         }
         result.processed += 1
         result.freedBytes += candidate.sizeBytes
@@ -353,7 +447,7 @@ export function apply(ctx: Context, config: Config): void {
     }
     if (result.failures > 0) result.ok = false
 
-    // Rollback manifest for archive mode (reverse = move the dir back).
+    // Rollback manifest for archive mode (reverse = official unarchive + move the dir back).
     if (mode === 'archive' && result.processedIds.length > 0) {
       try {
         const manifestDir = join(archiveRoot, '_manifests')
@@ -366,7 +460,10 @@ export function apply(ctx: Context, config: Config): void {
           entries: candidates
             .filter(c => result.processedIds.includes(c.id))
             .map(c => ({ id: c.id, workspaceDir: c.workspaceDir, sizeBytes: c.sizeBytes })),
-          rollback: 'move each <id> dir back from sessions-archive/<workspaceDir>/ to sessions/<workspaceDir>/',
+          rollback:
+            'move each <id> dir back from sessions-archive/<workspaceDir>/ to sessions/<workspaceDir>/'
+            + ' (ids are registered in the official archive set; restore via the GUI archived view,'
+            + ' or workspaceRegistry.unarchiveSession after moving back)',
         }
         await writeFile(manifestPath, JSON.stringify(manifest, null, 2), 'utf8')
         result.manifestPath = manifestPath
@@ -387,6 +484,109 @@ export function apply(ctx: Context, config: Config): void {
     return { mode: (mode === 'delete' ? 'delete' : 'archive'), dryRun, minIdleHours: typeof hours === 'number' ? hours : undefined }
   }
 
+  /** One archive-set backfill item parsed from a cleanup manifest. */
+  interface BackfillItem { id: string; workspaceDir: string }
+
+  /** Read every archive-mode manifest entry, deduped by id (first wins). */
+  async function readBackfillItems(): Promise<{ items: BackfillItem[]; manifests: number; malformed: number }> {
+    const manifestDir = join(archiveRoot, '_manifests')
+    const items = new Map<string, BackfillItem>()
+    let manifests = 0
+    let malformed = 0
+    let files: string[] = []
+    try {
+      files = (await readdir(manifestDir)).filter(f => f.startsWith('cleanup-') && f.endsWith('.json')).sort()
+    } catch {
+      return { items: [], manifests: 0, malformed: 0 }
+    }
+    for (const file of files) {
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(await readFile(join(manifestDir, file), 'utf8'))
+      } catch {
+        malformed += 1
+        continue
+      }
+      const doc = parsed as { mode?: string; entries?: Array<{ id?: unknown; workspaceDir?: unknown }> }
+      if (doc?.mode !== 'archive' || !Array.isArray(doc.entries)) continue
+      manifests += 1
+      for (const entry of doc.entries) {
+        if (typeof entry?.id !== 'string' || typeof entry?.workspaceDir !== 'string') continue
+        if (!isSubagentDirName(entry.id)) continue
+        if (!items.has(entry.id)) items.set(entry.id, { id: entry.id, workspaceDir: entry.workspaceDir })
+      }
+    }
+    return { items: [...items.values()], manifests, malformed }
+  }
+
+  /**
+   * Backfill the official archive set from past cleanup manifests.
+   *
+   * The registry refuses unknown sessions, and moved-away ids are unknown —
+   * so each backfilled id is transiently moved back into `sessions/`,
+   * registered via `workspaceRegistry.archiveSession`, then moved back to the
+   * archive root. Best run while the user is idle: moved-back rows blip into
+   * session listings for the duration of one id's registration.
+   */
+  async function backfillArchiveSet(dryRun: boolean): Promise<Record<string, JsonValue>> {
+    const registry = resolveWorkspaceRegistry(ctx)
+    if (registry === undefined) {
+      return { ok: false, error: 'workspaceRegistry 服务不可用(此 profile 未挂 workspace 包),无法回填官方归档集合' }
+    }
+    const { items, manifests, malformed } = await readBackfillItems()
+    const alreadyArchived = new Set(registry.archivedSessionIds)
+    const outcome = {
+      ok: true,
+      error: undefined as string | undefined,
+      dryRun,
+      manifests,
+      malformedManifests: malformed,
+      idsTotal: items.length,
+      alreadyRegistered: 0,
+      registered: 0,
+      missingArchiveDir: 0,
+      projcachePruned: 0,
+      failures: 0,
+      failureDetails: [] as string[],
+    }
+    for (const item of items) {
+      if (alreadyArchived.has(item.id)) {
+        outcome.alreadyRegistered += 1
+        continue
+      }
+      const archiveDir = join(archiveRoot, item.workspaceDir, item.id)
+      const liveDir = join(home, 'sessions', item.workspaceDir, item.id)
+      if (!existsSync(archiveDir)) {
+        outcome.missingArchiveDir += 1
+        continue
+      }
+      if (dryRun) {
+        outcome.registered += 1
+        continue
+      }
+      if (existsSync(liveDir)) {
+        outcome.failures += 1
+        outcome.failureDetails.push(`${item.id}: live 目录与归档目录同时存在,跳过(需人工核对)`)
+        continue
+      }
+      try {
+        await rename(archiveDir, liveDir)
+        try {
+          await registry.archiveSession(item.id)
+          outcome.registered += 1
+        } finally {
+          if (existsSync(liveDir)) await rename(liveDir, archiveDir)
+        }
+        if (pruneProjcache && await pruneProjcacheRecord(home, item.id)) outcome.projcachePruned += 1
+      } catch (error) {
+        outcome.failures += 1
+        outcome.failureDetails.push(`${item.id}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    if (outcome.failures > 0) outcome.ok = false
+    return toJsonValue(outcome)
+  }
+
   ctx.systemPrompt.section({
     name: 'tool:subagent-cleanup',
     order: SECTION_ORDER,
@@ -394,7 +594,7 @@ export function apply(ctx: Context, config: Config): void {
       ? ''
       : [
         `子agent会话清理的分界:清理"本会话自己攒下的"子agent对话(长期任务收尾、结算通知已收完、不再需要 send_message 续聊)用 ${toolSelf},它按官方枚举处置你名下的后代,无需闲置等待;跨 workspace 的例行大扫除/堆积处理用 ${toolGlobal},判据更严(进程启动后未写入 + 闲置 ${defaultIdleHours}h)。`,
-        `- 两个工具默认都是 archive(移到 sessions-archive,可逆,manifest 记录回滚清单);彻底删除需显式 mode:"delete",先向用户确认。`,
+        `- 两个工具默认都是 archive(先登记官方归档集合再移到 sessions-archive,可逆,manifest 记录回滚清单);彻底删除需显式 mode:"delete",先向用户确认。`,
         `- 不确定影响面时先 dryRun:true 看清单。`,
         `- 长期 goal 会话收尾阶段,主动向用户建议清理本次任务的子agent会话。`,
       ].join('\n'),
@@ -405,9 +605,10 @@ export function apply(ctx: Context, config: Config): void {
     name: toolSelf,
     description:
       '会话自清:清理"本会话自己的子agent"对话记录(含子agent再派的更深层后代)。通过子agent服务的官方枚举确定归属与状态,只处置已停稳的后代(正在跑的、刚结算仍在写入的会跳过)。'
+      + '归档会先登记官方归档集合(工作区侧栏按归档过滤、可从归档视图恢复)再物理搬移。'
       + '何时用:长期自主任务收尾时清掉本次攒下的子agent对话;用户说"把这次的子agent记录清了/删了"。'
       + '何时不用:清别的会话/别的 workspace 的堆积用 ' + toolGlobal + '(判据更严);还想对某个子agent send_message 续聊就别清它。'
-      + '默认 mode=archive(移到 sessions-archive,可逆);mode="delete" 彻底删除(不可恢复,先向用户确认);dryRun=true 只看清单不动手。可选 ids 点名(必须是本会话后代)。',
+      + '默认 mode=archive(先登记官方归档集合再移到 sessions-archive,可逆);mode="delete" 彻底删除(不可恢复,先向用户确认);dryRun=true 只看清单不动手。可选 ids 点名(必须是本会话后代)。',
     parameters: {
       mode: { type: 'string', description: 'archive(默认,移到 sessions-archive 可逆)或 delete(彻底删除,不可恢复)' },
       dryRun: { type: 'boolean', description: '只报告将处置的清单,不实际执行;默认 false' },
@@ -453,13 +654,13 @@ export function apply(ctx: Context, config: Config): void {
         liveBufferMs,
       }, common.mode, common.dryRun)
 
-      return {
+      return toJsonValue({
         ...result,
         scope: 'self',
         caller: String(caller.id),
         descendantsFound: descendants.candidates.length,
         notOnDisk: descendants.unknown,
-      } as unknown as Record<string, JsonValue>
+      })
     },
   }))
 
@@ -468,16 +669,19 @@ export function apply(ctx: Context, config: Config): void {
     name: toolGlobal,
     description:
       '跨 workspace 清理子agent会话堆积(运维侧):按目录形态扫描所有 workspace 的子agent会话(裸 UUID 目录,主会话绝不触碰),只处置"当前 DSH 进程启动后从未写入 && 闲置超阈值"的冷记录。'
+      + '归档会先登记官方归档集合(工作区侧栏按归档过滤、可从归档视图恢复)再物理搬移。'
       + '何时用:GUI 变卡、session.list 膨胀时的例行大扫除;用户说"清理所有/某 workspace 的旧子agent会话"。'
       + '何时不用:会话清自己的子agent用 ' + toolSelf + '(无闲置门槛,枚举权威)。'
       + '参数:workspace(子串过滤,如 "StarRail")/ parent(点名某父会话,按其枚举处置,判据同自清)/ 省略两者=全量扫描。'
-      + '默认 mode=archive(可逆,落 manifest 回滚清单);mode="delete" 彻底删除(先向用户确认);dryRun=true 预览;minIdleHours 默认 ' + String(defaultIdleHours) + '。',
+      + '默认 mode=archive(可逆,落 manifest 回滚清单);mode="delete" 彻底删除(先向用户确认);dryRun=true 预览;minIdleHours 默认 ' + String(defaultIdleHours) + '。'
+      + 'backfillArchiveSet=true:不清理,只把历史 manifest 里的已归档 id 补登记进官方归档集合(一次性维护操作)。',
     parameters: {
       workspace: { type: 'string', description: 'workspace 目录名子串过滤(大小写不敏感),如 "StarRail";省略=所有 workspace' },
       parent: { type: 'string', description: '点名清理某父会话(session- 前缀 id)名下的全部子agent;提供时按官方枚举处置,判据同自清工具(无闲置小时门槛)' },
-      mode: { type: 'string', description: 'archive(默认,移到 sessions-archive 可逆)或 delete(彻底删除,不可恢复)' },
+      mode: { type: 'string', description: 'archive(默认,先登记官方归档集合再移到 sessions-archive,可逆)或 delete(彻底删除,不可恢复)' },
       dryRun: { type: 'boolean', description: '只报告将处置的清单,不实际执行;默认 false' },
       minIdleHours: { type: 'number', description: `闲置门槛小时数,默认 ${defaultIdleHours};仅全量扫描模式生效(parent 点名时忽略)` },
+      backfillArchiveSet: { type: 'boolean', description: 'true=不清理,只从历史 manifest 把已归档 id 补登记进官方归档集合(一次性维护;先 dryRun 预览)' },
     },
     output: {
       schema: { type: 'object', additionalProperties: true },
@@ -485,6 +689,10 @@ export function apply(ctx: Context, config: Config): void {
     },
     isConcurrencySafe: () => false,
     async execute(args): Promise<Record<string, JsonValue>> {
+      if (args.backfillArchiveSet === true) {
+        const dryRun = args.dryRun === true
+        return backfillArchiveSet(dryRun)
+      }
       const common = readCommonArgs(args)
       if ('error' in common) return { ok: false, error: common.error }
       const nowMs = Date.now()
@@ -501,13 +709,13 @@ export function apply(ctx: Context, config: Config): void {
           const result = await runSweep(descendants.candidates, {
             nowMs, processStartMs: undefined, minIdleMs: 0, settleBufferMs, liveBufferMs,
           }, common.mode, common.dryRun)
-          return {
+          return toJsonValue({
             ...result,
             scope: 'parent',
             parent: parentId,
             descendantsFound: descendants.candidates.length,
             notOnDisk: descendants.unknown,
-          } as unknown as Record<string, JsonValue>
+          })
         } catch (error) {
           return { ok: false, error: `父会话枚举失败(可能不是会话 id): ${error instanceof Error ? error.message : String(error)}` }
         }
@@ -536,17 +744,18 @@ export function apply(ctx: Context, config: Config): void {
         settleBufferMs,
         liveBufferMs,
       }, common.mode, common.dryRun)
-      return {
+      return toJsonValue({
         ...result,
         scope: 'sweep',
         workspaceFilter: filter ?? null,
         minIdleHours,
         processStartedAt: new Date(processStartMs).toISOString(),
-      } as unknown as Record<string, JsonValue>
+      })
     },
   }))
 
   ctx.logger.info(
-    `subagent-cleanup: active (tools ${toolSelf}/${toolGlobal}, home ${home}, idle gate ${defaultIdleHours}h)`,
+    `subagent-cleanup: active (tools ${toolSelf}/${toolGlobal}, home ${home}, idle gate ${defaultIdleHours}h,`
+    + ` official-archive-set ${registerOfficialArchive ? 'on' : 'off'}, projcache prune ${pruneProjcache ? 'on' : 'off'})`,
   )
 }

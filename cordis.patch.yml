@@ -5,6 +5,8 @@
     - id: subagent-cleanup
       name: '@momojie-s/dsh-subagent-cleanup'
       config:
-        defaultIdleHours: 24      # 运维大扫除的默认闲置门槛（小时）
-        settleBufferMs: 30000     # inactive(仅磁盘)子级的写入缓冲（毫秒）
-        liveBufferMs: 600000      # running(在内存)子级需静默多久才可处置（毫秒）
+        defaultIdleHours: 24        # 运维大扫除的默认闲置门槛（小时）
+        settleBufferMs: 30000       # inactive(仅磁盘)子级的写入缓冲（毫秒）
+        liveBufferMs: 600000        # running(在内存)子级需静默多久才可处置（毫秒）
+        registerOfficialArchive: true  # 归档前先登记官方归档集合（workspaceRegistry 不可用时自动退化为纯搬移）
+        pruneProjcache: true           # 处置后删除该会话的持久投影缓存记录（进程内残影到下次重启为止）
