@@ -11,7 +11,7 @@ DSH 官方没有会话删除能力(API 只有归档隐藏,不减少 `session.lis
 
 ## 环境要求
 
-- DSH `>= 0.1.5-rc.1`(已验证至 `0.2.1-rc.5`);host 半部插件,无浏览器组件,任意 profile 可用
+- DSH `>= 0.1.5-rc.1`(已验证至 `0.2.2-rc.1`);host 半部插件,无浏览器组件,任意 profile 可用
 - Windows / Linux / macOS(`fs.rename` 同卷移动;DSH home 与 sessions 同盘)
 - **0.2.0 机制注**:归档模式会先调官方 `workspaceRegistry.archiveSession` 登记 id 再搬移;workspace 包未挂载的 profile 自动退化为纯搬移(功能不损失,仅少官方归档集合语义)
 
